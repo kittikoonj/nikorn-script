@@ -7,6 +7,10 @@
  *   node getFileName.js --once --psftp --download
  *   node getFileName.js --once --psftp --download --file CDR.csv
  *
+ * หลังดาวน์โหลดสำเร็จ จะ zip ไฟล์นั้นแล้วเก็บ backup ที่
+ *   ./backup/yyyy/mm/dd/<ชื่อไฟล์>_<HHmmss>.zip
+ * (โฟลเดอร์อยู่ข้างสคริปต์นี้)
+ *
  * รันตาม schedule ใน config (cron.enabled: true) หรือบังคับ:
  *   node getFileName.js --schedule
  *   หลาย schedule ได้ที่ cron.jobs[] ใน getFileName.config.js
@@ -16,6 +20,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const zlib = require('zlib');
 const cron = require('node-cron');
 const { Client } = require('ssh2');
 const { spawn } = require('child_process');
@@ -252,6 +257,123 @@ function runPsftpWithCommands(commands) {
   });
 }
 
+function crc32(buf) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    crc ^= buf[i];
+    for (let j = 0; j < 8; j++) {
+      const mask = -(crc & 1);
+      crc = (crc >>> 1) ^ (0xedb88320 & mask);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date) {
+  const time =
+    (date.getHours() << 11) |
+    (date.getMinutes() << 5) |
+    ((date.getSeconds() / 2) | 0);
+  const dosDate =
+    ((date.getFullYear() - 1980) << 9) |
+    ((date.getMonth() + 1) << 5) |
+    date.getDate();
+  return { time, dosDate };
+}
+
+/** zip ไฟล์เดียว (deflate) — ไม่พึ่งคำสั่ง zip ของระบบ เพื่อให้รันบน Windows ได้ */
+function buildSingleFileZip(entryName, data, date) {
+  const nameBuf = Buffer.from(entryName, 'utf8');
+  const compressed = zlib.deflateRawSync(data);
+  const crc = crc32(data);
+  const { time, dosDate } = dosDateTime(date);
+  const flags = 0x800;
+
+  const local = Buffer.alloc(30 + nameBuf.length);
+  local.writeUInt32LE(0x04034b50, 0);
+  local.writeUInt16LE(20, 4);
+  local.writeUInt16LE(flags, 6);
+  local.writeUInt16LE(8, 8);
+  local.writeUInt16LE(time, 10);
+  local.writeUInt16LE(dosDate, 12);
+  local.writeUInt32LE(crc, 14);
+  local.writeUInt32LE(compressed.length, 18);
+  local.writeUInt32LE(data.length, 22);
+  local.writeUInt16LE(nameBuf.length, 26);
+  local.writeUInt16LE(0, 28);
+  nameBuf.copy(local, 30);
+
+  const central = Buffer.alloc(46 + nameBuf.length);
+  central.writeUInt32LE(0x02014b50, 0);
+  central.writeUInt16LE(20, 4);
+  central.writeUInt16LE(20, 6);
+  central.writeUInt16LE(flags, 8);
+  central.writeUInt16LE(8, 10);
+  central.writeUInt16LE(time, 12);
+  central.writeUInt16LE(dosDate, 14);
+  central.writeUInt32LE(crc, 16);
+  central.writeUInt32LE(compressed.length, 20);
+  central.writeUInt32LE(data.length, 24);
+  central.writeUInt16LE(nameBuf.length, 28);
+  central.writeUInt16LE(0, 30);
+  central.writeUInt16LE(0, 32);
+  central.writeUInt16LE(0, 34);
+  central.writeUInt16LE(0, 36);
+  central.writeUInt32LE(0, 38);
+  central.writeUInt32LE(0, 42);
+  nameBuf.copy(central, 46);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(1, 8);
+  eocd.writeUInt16LE(1, 10);
+  eocd.writeUInt32LE(central.length, 12);
+  eocd.writeUInt32LE(local.length + compressed.length, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([local, compressed, central, eocd]);
+}
+
+/** CDR.csv + 15:40:12 → CDR_154012.csv.zip */
+function backupZipName(filename, date) {
+  const stamp = [
+    date.getHours(),
+    date.getMinutes(),
+    date.getSeconds(),
+  ]
+    .map((n) => String(n).padStart(2, '0'))
+    .join('');
+  const ext = path.extname(filename);
+  const stem = ext ? filename.slice(0, -ext.length) : filename;
+  return `${stem}_${stamp}${ext}.zip`;
+}
+
+/**
+ * zip ไฟล์ที่ดาวน์โหลดแล้ว เก็บที่ <script>/backup/yyyy/mm/dd/<ชื่อ>_<HHmmss>.zip
+ * @returns {string} path ของ zip
+ */
+function backupDownloadedFile(localFilePath, date = new Date()) {
+  if (!fs.existsSync(localFilePath)) {
+    throw new Error(`ไม่พบไฟล์สำหรับ backup: ${localFilePath}`);
+  }
+  const data = fs.readFileSync(localFilePath);
+  if (data.length >= 0xffffffff) {
+    throw new Error(`ไฟล์ใหญ่เกิน 4GB zip ไม่ได้: ${localFilePath}`);
+  }
+  const y = String(date.getFullYear());
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  const backupDir = path.join(__dirname, 'backup', y, m, d);
+  fs.mkdirSync(backupDir, { recursive: true });
+  const base = path.basename(localFilePath);
+  const zipPath = path.join(backupDir, backupZipName(base, date));
+  fs.writeFileSync(zipPath, buildSingleFileZip(base, data, date));
+  console.log('  backup ->', zipPath);
+  return zipPath;
+}
+
 function downloadViaPsftp(files, listFilePath) {
   if (files.length === 0) {
     console.log('ไม่มีไฟล์ให้ดาวน์โหลด');
@@ -272,6 +394,7 @@ function downloadViaPsftp(files, listFilePath) {
       `get "${filename}"`,
     ];
     return runPsftpWithCommands(commands).then(() => {
+      backupDownloadedFile(path.join(absDir, filename));
       if (listFilePath) appendToDownloadedList(filename);
     });
   };
@@ -595,12 +718,14 @@ async function main() {
   return runOnceFromArgv();
 }
 
-main()
-  .then((code) => {
-    if (code === null) return;
-    process.exit(typeof code === 'number' ? code : 0);
-  })
-  .catch((err) => {
-    console.error(err);
-    process.exit(1);
-  });
+if (require.main === module) {
+  main()
+    .then((code) => {
+      if (code === null) return;
+      process.exit(typeof code === 'number' ? code : 0);
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });
+}
